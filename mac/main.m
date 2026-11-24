@@ -164,9 +164,14 @@ static WPEntry *WPParseEntry(NSString *text, NSString *word) {
     entry.headword = word;
     NSString *body = text;
     NSArray<NSString *> *parts = [text componentsSeparatedByString:@" | "];
+    NSString *firstPart = nil;
     if (parts.count >= 2) {
-        // "better 1" -> "better", "natively na·tive·ly" -> "natively"
-        entry.headword = WPReplace(WPReplace(parts[0], @"\\s+\\S*·\\S*$", @""), @"\\s*\\d+$", @"");
+        // "project A. noun | BrE … | ① …": the parts of speech are said differently, each with its own pronunciation.
+        NSString *head = parts[0];
+        firstPart = WPFirstMatch(head, @"\\s([A-H]\\. [a-z].*)$", 1);
+        if (firstPart) head = [head substringToIndex:head.length - firstPart.length - 1];
+        // "better 1" -> "better", "natively na·tive·ly" -> "natively", "email, e-mail" -> "email"
+        entry.headword = WPReplace(WPReplace(WPReplace(head, @",.*$", @""), @"\\s+\\S*·\\S*$", @""), @"\\s*\\d+$", @"");
         NSUInteger bodyStart = 1;
         NSCharacterSet *ipa = [NSCharacterSet characterSetWithCharactersInString:@"ˈˌːəɪʊʌæɒɔɛθðŋʃʒ"];
         if (parts.count >= 3 && ([parts[1] hasPrefix:@"BrE "] || [parts[1] rangeOfCharacterFromSet:ipa].location != NSNotFound)) {
@@ -174,6 +179,7 @@ static WPEntry *WPParseEntry(NSString *text, NSString *word) {
             bodyStart = 2;
         }
         body = [[parts subarrayWithRange:NSMakeRange(bodyStart, parts.count - bodyStart)] componentsJoinedByString:@" | "];
+        if (firstPart) body = [NSString stringWithFormat:@"%@ %@", firstPart, body];
     }
 
     NSString *tones = @"āáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜ";
@@ -207,7 +213,9 @@ static WPEntry *WPLookUp(NSString *word) {
     // "went | … | past tense → go A, B": show the entry for "go" underneath.
     NSString *body = [entry.lines componentsJoinedByString:@" "];
     if (body.length < 100) {
-        NSString *target = WPFirstMatch(body, @"→ ([A-Za-z][A-Za-z'-]*[A-Za-z])", 1);
+        // "analog | … | adjective, noun US = analogue" likewise.
+        NSString *target = WPFirstMatch(body, @"→ ([A-Za-z][A-Za-z'-]*[A-Za-z])", 1)
+                               ?: WPFirstMatch(body, @"= ([A-Za-z][A-Za-z'-]*[A-Za-z])$", 1);
         if (target && ![target.lowercaseString isEqualToString:entry.headword.lowercaseString]) {
             NSString *seeText = WPDefinitionText(target);
             if (seeText) entry.see = WPParseEntry(seeText, target);
@@ -222,7 +230,8 @@ static NSArray<NSString *> *WPGlosses(WPEntry *entry, NSUInteger limit) {
     for (NSString *line in entry.lines) {
         if (glosses.count >= limit) break;
         if ([line hasPrefix:@"▸"] || [line hasPrefix:@"•"]) continue;
-        NSString *gloss = WPFirstMatch(line, @"[（(]?\\p{Han}[\\p{Han}（）、·…]*", 0);
+        // Skip notes on usage: "③ US (housing development) [政府出资兴建、租金较低的] 住宅区" -> "住宅区"
+        NSString *gloss = WPFirstMatch(WPReplace(line, @"\\[[^\\]]*\\]", @""), @"[（(]?\\p{Han}[\\p{Han}（）、·…]*", 0);
         if (gloss) [glosses addObject:gloss];
     }
     return glosses.array;
@@ -237,13 +246,16 @@ static NSString *WPShortMeaning(WPEntry *entry) {
         // "adverb" / "1 by birth or origin; naturally or originally: crab apple …" -> "by birth or origin; …"
         for (NSString *line in entry.lines) {
             NSString *sense = WPReplace(line, @"^(?:(?:noun|verb|adjective|adverb|exclamation|preposition|conjunction|"
-                                              @"pronoun|determiner|abbreviation|prefix|suffix)\\b\\s*)?(?:\\d{1,2} )?", @"");
+                                              @"pronoun|determiner|abbreviation|prefix|suffix)\\b[,\\s]*)*(?:\\d{1,2} )?", @"");
             sense = [[sense componentsSeparatedByString:@":"].firstObject
                 stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
             if (sense.length < 3 || [sense hasPrefix:@"•"] || [sense hasPrefix:@"▸"]) continue;
             meaning = sense.length > 80 ? [[sense substringToIndex:80] stringByAppendingString:@"…"] : sense;
             break;
         }
+        // "US = analogue" -> "US = analogue：类似物"
+        NSArray<NSString *> *seeGlosses = entry.see ? WPGlosses(entry.see, 2) : @[];
+        if (seeGlosses.count) meaning = [NSString stringWithFormat:@"%@：%@", meaning, [seeGlosses componentsJoinedByString:@"；"]];
     } else if (!glosses.count) {
         meaning = entry.lines.firstObject ?: @"";
         NSArray<NSString *> *seeGlosses = entry.see ? WPGlosses(entry.see, 2) : @[];
@@ -672,14 +684,47 @@ static BOOL WPPointInTitleBar(pid_t pid, CGPoint point) {
 // next request starts it again. Requests block, so call these off the main thread.
 @interface WPOCRClient : NSObject
 // The word under a point (global display coordinates), and its box in the same
-// coordinates; nil with a reason ("none", "permission", "capture", "helper").
+// coordinates; nil with a reason ("none", "permission", "capture", "preparing", "helper").
 - (NSString *)wordAt:(CGPoint)point box:(CGRect *)box dumpTo:(NSString *)dump failure:(NSString **)failure;
+// Has Vision's accurate model compiled if it isn't yet (about 27 s, after a macOS update).
+// Until that is over, words only the accurate model can read fail with "preparing".
+- (void)warmUp;
 @end
 
 @implementation WPOCRClient {
     NSTask *_task;
     NSPipe *_input;
     NSPipe *_output;
+    NSTask *_warmUp;
+    atomic_bool _warm;
+}
+
+// In a process of its own, which nothing cuts short: the compiled model is only cached
+// once it is complete, so stopping half-way means starting over the next time.
+- (void)warmUp {
+    @synchronized(self) {
+        if (_warmUp.running) return;
+        atomic_store(&_warm, false);
+        NSString *path = [NSBundle.mainBundle pathForAuxiliaryExecutable:@"WordPopOCR"];
+        if (!path) return;
+        _warmUp = [NSTask new];
+        _warmUp.executableURL = [NSURL fileURLWithPath:path];
+        _warmUp.arguments = @[ @"--warm" ];
+        _warmUp.standardInput = NSFileHandle.fileHandleWithNullDevice;
+        _warmUp.standardOutput = NSFileHandle.fileHandleWithNullDevice;
+        _warmUp.standardError = NSFileHandle.fileHandleWithNullDevice;
+        CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+        __weak WPOCRClient *weakSelf = self;
+        _warmUp.terminationHandler = ^(NSTask *task) {
+            os_log(OS_LOG_DEFAULT, "OCR model ready after %.1f s (status %d)", CFAbsoluteTimeGetCurrent() - start, task.terminationStatus);
+            WPOCRClient *client = weakSelf;
+            if (client) atomic_store(&client->_warm, true);
+        };
+        if (![_warmUp launchAndReturnError:nil]) {
+            _warmUp = nil;
+            atomic_store(&_warm, true);
+        }
+    }
 }
 
 - (BOOL)start {
@@ -700,12 +745,16 @@ static BOOL WPPointInTitleBar(pid_t pid, CGPoint point) {
     return YES;
 }
 
-- (NSString *)readLine:(int)timeoutSeconds {
+- (NSString *)readLine:(int)timeoutSeconds timedOut:(BOOL *)timedOut {
     int fd = _output.fileHandleForReading.fileDescriptor;
     NSMutableData *line = [NSMutableData data];
     for (;;) {
         struct pollfd output = {fd, POLLIN, 0};
-        if (poll(&output, 1, timeoutSeconds * 1000) <= 0) return nil;
+        int ready = poll(&output, 1, timeoutSeconds * 1000);
+        if (ready <= 0) {
+            *timedOut = ready == 0;
+            return nil;
+        }
         char c;
         if (read(fd, &c, 1) != 1) return nil;  // the helper quit
         if (c == '\n') return [[NSString alloc] initWithData:line encoding:NSUTF8StringEncoding];
@@ -717,23 +766,32 @@ static BOOL WPPointInTitleBar(pid_t pid, CGPoint point) {
     NSData *data = [[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
     for (int attempt = 0; attempt < 2; attempt++) {  // it may have quit for being idle just now
         if (!_task.running && ![self start]) return nil;
+        BOOL timedOut = NO;
         if (write(_input.fileHandleForWriting.fileDescriptor, data.bytes, data.length) == (ssize_t)data.length) {
-            NSString *reply = [self readLine:6];  // first use loads the model and may ask for permission
+            NSString *reply = [self readLine:5 timedOut:&timedOut];  // first use loads the model
             if (reply) return reply;
         }
         [_task terminate];
         _task = nil;
+        if (timedOut) {
+            // Most likely compiling the accurate model (its cache was cleared while the app
+            // was running). Asking a new helper would only start that over.
+            os_log(OS_LOG_DEFAULT, "OCR helper timed out");
+            [self warmUp];
+            return @"-\tpreparing";
+        }
     }
     return nil;
 }
 
 - (NSString *)wordAt:(CGPoint)point box:(CGRect *)box dumpTo:(NSString *)dump failure:(NSString **)failure {
-    NSString *line = [NSString stringWithFormat:@"%.1f %.1f", point.x, point.y];
+    NSString *line = [NSString stringWithFormat:@"%.1f %.1f %@", point.x, point.y, atomic_load(&_warm) ? @"full" : @"fast"];
     if (dump) line = [line stringByAppendingFormat:@" %@", dump];
     NSString *reply = [self request:line];
     NSArray<NSString *> *fields = [reply componentsSeparatedByString:@"\t"];
     if (fields.count < 5) {
         *failure = fields.count == 2 ? fields[1] : @"helper";
+        if (![*failure isEqualToString:@"none"]) os_log(OS_LOG_DEFAULT, "screen read failed: %{public}@", *failure);
         if ([*failure isEqualToString:@"permission"]) {  // a fresh helper picks up the permission once granted
             [_task terminate];
             _task = nil;
@@ -1022,14 +1080,27 @@ static NSString *const kDefaultsExcluded = @"ExcludedApps";
                                   @"dev.zed.Zed", @"com.sublimetext.4", @"com.panic.Nova", @"com.jetbrains.pycharm",
                                   @"com.jetbrains.pycharm.ce" ],
         }];
-        _popup = [WPPopup new];
+        [self makePopup];
         _ocr = [WPOCRClient new];
         _ocrQueue = dispatch_queue_create("wordpop.ocr", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
-        __weak WPController *weakSelf = self;
-        _popup.onToggle = ^{ [weakSelf toggleListed]; };
-        _popup.onSpeak = ^{ [weakSelf speak]; };
     }
     return self;
+}
+
+// After the display goes away and comes back (an external monitor waking from sleep), the
+// old panel can stop showing over full-screen apps until WordPop restarts: start a new one.
+- (void)makePopup {
+    [_popup orderOut:nil];
+    _popup = [WPPopup new];
+    __weak WPController *weakSelf = self;
+    _popup.onToggle = ^{ [weakSelf toggleListed]; };
+    _popup.onSpeak = ^{ [weakSelf speak]; };
+}
+
+- (void)screensChanged:(NSNotification *)notification {
+    [self hidePopup:@"screens changed"];
+    [self makePopup];
+    WPLog(@"screens changed: new popup");
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
@@ -1054,6 +1125,12 @@ static NSString *const kDefaultsExcluded = @"ExcludedApps";
                                                        selector:@selector(appActivated:)
                                                            name:NSWorkspaceDidActivateApplicationNotification
                                                          object:nil];
+    [NSNotificationCenter.defaultCenter addObserver:self
+                                           selector:@selector(screensChanged:)
+                                               name:NSApplicationDidChangeScreenParametersNotification
+                                             object:nil];
+
+    [_ocr warmUp];
 
     // Load the dictionary and the fonts now, so the first popup is as quick as the rest.
     dispatch_async(_queue, ^{ WPLookUp(@"hello"); });
@@ -1253,7 +1330,7 @@ static const NSTimeInterval kCommandTap = 0.35;
 
 - (void)commandTapped {
     unsigned long request = atomic_fetch_add(&gRequest, 1) + 1;
-    [self hidePopup];
+    [self hidePopup:@"⌘ tap"];
     if (!_trusted) {
         [self openAccessibilitySettings];
         return;
@@ -1269,6 +1346,7 @@ static const NSTimeInterval kCommandTap = 0.35;
     WPOCRClient *ocr = _ocr;
     dispatch_queue_t ocrQueue = _ocrQueue;
     dispatch_async(_queue, ^{
+        if (atomic_load(&gRequest) != request) return;  // tapped or clicked again meanwhile
         // Nothing selected: read the word under the pointer off the screen.
         __block NSString *screenWord = nil, *failure = nil;
         __block CGRect screenBox = CGRectNull;
@@ -1277,6 +1355,7 @@ static const NSTimeInterval kCommandTap = 0.35;
         void (^readScreen)(void) = ^{
             reading = YES;
             dispatch_group_async(screenRead, ocrQueue, ^{
+                if (atomic_load(&gRequest) != request) return;
                 NSString *reason = nil;
                 CGRect box = CGRectNull;
                 screenWord = [ocr wordAt:pointer box:&box dumpTo:nil failure:&reason];
@@ -1297,20 +1376,35 @@ static const NSTimeInterval kCommandTap = 0.35;
             }
         }
         NSString *word = WPCleanWord(text, YES);
-        if (!text.length) {
-            if (!reading) readScreen();
-            dispatch_group_wait(screenRead, DISPATCH_TIME_FOREVER);
-            word = WPCleanWord(screenWord, NO);
-            bounds = screenBox;
+        if (word) {
+            WPLog(@"⌘ tap in %d: %@", pid, word);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (atomic_load(&gRequest) != request) return;
+                [self lookUp:word anchor:[self anchorForBounds:bounds mouse:mouse] pid:pid explicit:YES];
+            });
+            return;
         }
-        WPLog(@"⌘ tap in %d: %@", pid, word ?: text ?: screenWord ?: failure);
-        dispatch_async(dispatch_get_main_queue(), ^{
+        // Nothing selected, or a selection that isn't a word (a paragraph left selected
+        // earlier, say): look up the word under the pointer instead. Not waited for here,
+        // so that a slow screen read doesn't hold up the lookups after it.
+        if (!reading) readScreen();
+        dispatch_group_notify(screenRead, dispatch_get_main_queue(), ^{
+            NSString *seen = WPCleanWord(screenWord, NO);
+            WPLog(@"⌘ tap in %d: %@", pid,
+                  seen ?: screenWord ?: failure ?: [NSString stringWithFormat:@"%lu characters copied", (unsigned long)text.length]);
             if (atomic_load(&gRequest) != request) return;
-            NSRect anchor = [self anchorForBounds:bounds mouse:mouse];
-            if (word) [self lookUp:word anchor:anchor pid:pid explicit:YES];
+            NSRect anchor = [self anchorForBounds:screenBox mouse:mouse];
+            if (seen) [self lookUp:seen anchor:anchor pid:pid explicit:YES];
             else if ([failure isEqualToString:@"permission"]) [self askForScreenRecordingNear:anchor];
+            else if ([failure isEqualToString:@"preparing"]) [self showPreparingNear:anchor];
         });
     });
+}
+
+- (void)showPreparingNear:(NSRect)anchor {
+    _entry = nil;
+    [_popup setText:WPMessage(@"正在准备文字识别模型，系统更新后的第一次约需半分钟。\n请稍后再按一次 ⌘。") status:nil action:nil];
+    [self showPopupNear:anchor pid:0];
 }
 
 - (void)askForScreenRecordingNear:(NSRect)anchor {
@@ -1344,7 +1438,7 @@ static const NSTimeInterval kCommandTap = 0.35;
 - (void)mouseDown:(NSEvent *)event {
     atomic_fetch_add(&gRequest, 1);
     _downPoint = NSEvent.mouseLocation;
-    [self hidePopup];
+    [self hidePopup:@"click"];
 }
 
 - (void)mouseUp:(NSEvent *)event {
@@ -1472,16 +1566,19 @@ static const NSTimeInterval kCommandTap = 0.35;
 - (void)showPopupNear:(NSRect)anchor pid:(pid_t)pid {
     _popupPid = pid;
     [_popup showNear:anchor];
+    WPLog(@"popup shown at %@", NSStringFromRect(_popup.frame));
+    if (!_popup.onActiveSpace) os_log(OS_LOG_DEFAULT, "popup ordered front but not on the active Space");
     if (!_dismissMonitor) {
         __weak WPController *weakSelf = self;
         NSEventMask mask = NSEventMaskKeyDown | NSEventMaskScrollWheel | NSEventMaskRightMouseDown | NSEventMaskOtherMouseDown;
         _dismissMonitor = [NSEvent addGlobalMonitorForEventsMatchingMask:mask handler:^(NSEvent *event) {
-            [weakSelf hidePopup];
+            [weakSelf hidePopup:[NSString stringWithFormat:@"event %lu", (unsigned long)event.type]];
         }];
     }
 }
 
-- (void)hidePopup {
+- (void)hidePopup:(NSString *)reason {
+    if (_popup.visible) WPLog(@"popup hidden: %@", reason);
     if (_dismissMonitor) {
         [NSEvent removeMonitor:_dismissMonitor];
         _dismissMonitor = nil;
@@ -1491,7 +1588,9 @@ static const NSTimeInterval kCommandTap = 0.35;
 
 - (void)appActivated:(NSNotification *)notification {
     NSRunningApplication *app = notification.userInfo[NSWorkspaceApplicationKey];
-    if (app.processIdentifier != _popupPid && app.processIdentifier != getpid()) [self hidePopup];
+    if (app.processIdentifier != _popupPid && app.processIdentifier != getpid()) {
+        [self hidePopup:[@"activated " stringByAppendingString:app.bundleIdentifier ?: @"?"]];
+    }
 }
 
 // Reads the word aloud in the best US English voice installed.

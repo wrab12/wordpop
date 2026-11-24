@@ -1,17 +1,26 @@
 // WordPopOCR: reads the word under a point on screen, for 划词查词's ⌥D when nothing is
 // selected (text in images, videos, games, remote desktops...). The app starts it on
 // demand and talks to it over stdin/stdout, one request per line:
-//   in:  "<x> <y> [dump.png]"           a point in global display coordinates (points,
-//                                        top-left origin); optionally save the capture
+//   in:  "<x> <y> <mode> [dump.png]"    a point in global display coordinates (points,
+//                                        top-left origin), "full" or "fast" (without the
+//                                        accurate model); optionally save the capture
 //   out: "<word>\t<x>\t<y>\t<w>\t<h>"   the word and its box, in the same coordinates
-//        "-\t<reason>"                  "none", "permission" or "capture"
+//        "-\t<reason>"                  "none", "permission", "capture" or "preparing"
+//                                        (it takes the accurate model to tell)
 // Vision's text model takes 40–70 MB once loaded, so it lives in this separate process,
 // which quits after kIdleSeconds without a request; the app starts it again when needed.
+//
+// After a macOS update (or when the caches are cleared) the accurate model is compiled
+// for the Neural Engine again on first use. That takes about 27 s and holds up every
+// other recognition in the process, so the app has it done ahead of time by a process
+// of its own, and sends only "fast" requests until that is over:
+//   WordPopOCR --warm
 //
 // Test on an image file:  WordPopOCR --image <file.png> <x> <y>   (pixels, top-left origin)
 
 #import <CoreGraphics/CoreGraphics.h>
 #import <CoreServices/CoreServices.h>
+#import <CoreText/CoreText.h>
 #import <Foundation/Foundation.h>
 #import <ImageIO/ImageIO.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
@@ -195,13 +204,17 @@ static CGImageRef WPUpscaled(CGImageRef image, CGFloat factor) {
 // text. When what it read at the point isn't a real word (outlined video subtitles,
 // busy backgrounds), the accurate model (~90 ms) reads it again.
 // `pixelsPerPoint` is the capture's scale: 2 on Retina displays, 1 on most external ones.
-static WPRecognizedWord *WPRecognize(CGImageRef image, CGPoint point, CGFloat pixelsPerPoint, NSString **mode) {
+// With `fastOnly`, gives up with the mode "preparing" where the accurate model is needed.
+static WPRecognizedWord *WPRecognize(CGImageRef image, CGPoint point, CGFloat pixelsPerPoint, BOOL fastOnly, NSString **mode) {
     CGFloat factor = pixelsPerPoint < 1.5 ? 2 : 1;
     CGImageRef scaled = factor > 1 ? WPUpscaled(image, factor) : CGImageRetain(image);
     CGPoint scaledPoint = CGPointMake(point.x * factor, point.y * factor);
     WPRecognizedWord *word = WPWordAt(scaled, scaledPoint, VNRequestTextRecognitionLevelFast);
     *mode = @"fast";
-    if (!word || !WPIsWord(word.word)) {
+    if (fastOnly && !(word && WPIsWord(word.word))) {
+        word = nil;
+        *mode = @"preparing";
+    } else if (!word || !WPIsWord(word.word)) {
         WPRecognizedWord *accurate = WPWordAt(scaled, scaledPoint, VNRequestTextRecognitionLevelAccurate);
         if (accurate) {
             word = accurate;
@@ -214,6 +227,30 @@ static WPRecognizedWord *WPRecognize(CGImageRef image, CGPoint point, CGFloat pi
         word.box = CGRectMake(box.origin.x / factor, box.origin.y / factor, box.size.width / factor, box.size.height / factor);
     }
     return word;
+}
+
+// Loads the accurate model by reading a line of Chinese and English with it, which has it
+// compiled and cached if need be. Whether that worked.
+static BOOL WPWarmUp(void) {
+    CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+    CGContextRef context = CGBitmapContextCreate(NULL, 1280, 192, 8, 0, space, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+    CGColorSpaceRelease(space);
+    if (!context) return NO;
+    CGContextSetRGBFillColor(context, 1, 1, 1, 1);
+    CGContextFillRect(context, CGRectMake(0, 0, 1280, 192));
+    CTFontRef font = CTFontCreateUIFontForLanguage(kCTFontUIFontSystem, 36, NULL);
+    NSAttributedString *text = [[NSAttributedString alloc] initWithString:@"推荐 recommend 划词查词 vocabulary"
+                                                               attributes:@{(__bridge id)kCTFontAttributeName: (__bridge id)font}];
+    CFRelease(font);
+    CTLineRef line = CTLineCreateWithAttributedString((__bridge CFAttributedStringRef)text);
+    CGContextSetTextPosition(context, 60, 80);
+    CTLineDraw(line, context);
+    CFRelease(line);
+    CGImageRef image = CGBitmapContextCreateImage(context);
+    CGContextRelease(context);
+    WPRecognizedWord *word = WPWordAt(image, CGPointMake(240, 100), VNRequestTextRecognitionLevelAccurate);
+    CGImageRelease(image);
+    return word != nil;
 }
 
 static CGImageRef WPCapture(CGRect rect, NSString **failure) {
@@ -276,13 +313,14 @@ static NSString *WPHandle(NSString *request) {
     NSString *failure = nil;
     CGImageRef image = WPCapture(rect, &failure);
     if (!image) return [@"-\t" stringByAppendingString:failure ?: @"capture"];
-    if (parts.count >= 3) WPSavePNG(image, parts[2]);
+    BOOL fastOnly = parts.count >= 3 && [parts[2] isEqualToString:@"fast"];
+    if (parts.count >= 4) WPSavePNG(image, parts[3]);
     CGFloat scale = CGImageGetWidth(image) / rect.size.width;  // 2 on Retina displays
     CGPoint pixel = CGPointMake((point.x - rect.origin.x) * scale, (point.y - rect.origin.y) * scale);
     NSString *mode = nil;
-    WPRecognizedWord *word = WPRecognize(image, pixel, scale, &mode);
+    WPRecognizedWord *word = WPRecognize(image, pixel, scale, fastOnly, &mode);
     CGImageRelease(image);
-    if (!word) return @"-\tnone";
+    if (!word) return [mode isEqualToString:@"preparing"] ? @"-\tpreparing" : @"-\tnone";
     CGRect box = word.box;
     return [NSString stringWithFormat:@"%@\t%.1f\t%.1f\t%.1f\t%.1f\t%@", word.word, rect.origin.x + box.origin.x / scale,
                                       rect.origin.y + box.origin.y / scale, box.size.width / scale, box.size.height / scale, mode];
@@ -303,6 +341,7 @@ static NSString *WPReadRequest(void) {
 
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
+        if (argc >= 2 && strcmp(argv[1], "--warm") == 0) return WPWarmUp() ? 0 : 1;
         if (argc >= 5 && strcmp(argv[1], "--image") == 0) {
             CGImageSourceRef source = CGImageSourceCreateWithURL(
                 (__bridge CFURLRef)[NSURL fileURLWithPath:@(argv[2])], NULL);
@@ -310,7 +349,7 @@ int main(int argc, const char *argv[]) {
             if (!image) return 1;
             CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
             NSString *mode = nil;
-            WPRecognizedWord *word = WPRecognize(image, CGPointMake(atof(argv[3]), atof(argv[4])), 2, &mode);
+            WPRecognizedWord *word = WPRecognize(image, CGPointMake(atof(argv[3]), atof(argv[4])), 2, NO, &mode);
             printf("%s\t%s\t%.0f ms\n", word.word.UTF8String ?: "-", mode.UTF8String, (CFAbsoluteTimeGetCurrent() - start) * 1000);
             return 0;
         }

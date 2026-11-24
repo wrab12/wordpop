@@ -105,7 +105,7 @@ int main(void) {
                     NSString *mode = nil;
                     CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
                     WPRecognizedWord *read = WPRecognize(rep.CGImage, CGPointMake([target[1] doubleValue], [target[2] doubleValue]),
-                                                         scenario.scale, &mode);
+                                                         scenario.scale, NO, &mode);
                     if (total > 0) scenarioTime += CFAbsoluteTimeGetCurrent() - start;  // the first call loads the model
                     scenarioTotal++;
                     if ([Clean(read.word) isEqualToString:Clean(target[0])]) scenarioRight++;
